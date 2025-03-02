@@ -2,6 +2,7 @@ import socket
 import json
 import concurrent.futures
 import requests
+import argparse
 from typing import Dict, List, Optional, Tuple
 import time
 
@@ -15,11 +16,13 @@ class AntminerScanner:
     }
     ASIC_TO_MODEL = {v: k for k, v in MODEL_ASIC_COUNTS.items()}
 
-    def __init__(self, ip_ranges: str, timeout: int = 15, retries: int = 3):
+    def __init__(self, ip_ranges: str, timeout: int = 15, retries: int = 3, debug: bool = False, debug_ip: str = None):
         self.ip_ranges = ip_ranges
         self.timeout = timeout
         self.retries = retries
         self.cgminer_port = 4028
+        self.debug = debug
+        self.debug_ip = debug_ip
 
     def parse_ip_ranges(self) -> List[str]:
         ip_list = []
@@ -77,18 +80,43 @@ class AntminerScanner:
         try:
             response = requests.get(url, timeout=self.timeout)
             response.raise_for_status()
-            return response.json()  # Returns the list of chain objects
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            print(f"Failed to fetch VNish {endpoint} for {ip}: {str(e)}")
-            return None
+            result = response.json()
+            if self.debug and ip == self.debug_ip:
+                print(f"Debug: VNish API response for {ip}/{endpoint}:")
+                print(json.dumps(result, indent=2))
+            return result
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP error fetching VNish {endpoint} for {ip}: {e}")
+            print(f"Status code: {e.response.status_code}")
+            print(f"Response: {e.response.text}")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Connection error fetching VNish {endpoint} for {ip}: {e}")
+        except requests.exceptions.Timeout as e:
+            print(f"Timeout fetching VNish {endpoint} for {ip}: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching VNish {endpoint} for {ip}: {e}")
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error for VNish {endpoint} response from {ip}: {e}")
+        return None
 
     def is_vnish_firmware(self, stats_response: Dict) -> bool:
         """Detect if the miner is running VNish firmware (e.g., based on CGMiner version or firmware field)."""
         if stats_response and 'STATS' in stats_response:
             for stat in stats_response['STATS']:
-                if 'CGMiner' in stat and '4.11.1' in str(stat.get('CGMiner', '')):  # VNish uses CGMiner 4.11.1
+                # Check for CGMiner version
+                if 'CGMiner' in stat and '4.11.1' in str(stat.get('CGMiner', '')):
+                    if self.debug:
+                        print(f"VNish firmware detected via CGMiner version: {stat.get('CGMiner', '')}")
                     return True
+                # Check for Firmware field containing 'vnish'
                 if 'Firmware' in stat and 'vnish' in str(stat.get('Firmware', '')).lower():
+                    if self.debug:
+                        print(f"VNish firmware detected via Firmware field: {stat.get('Firmware', '')}")
+                    return True
+                # Check for specific version 1.2.6-rc4
+                if 'Firmware' in stat and '1.2.6-rc4' in str(stat.get('Firmware', '')):
+                    if self.debug:
+                        print(f"VNish firmware detected via version 1.2.6-rc4: {stat.get('Firmware', '')}")
                     return True
         return False
 
@@ -120,20 +148,33 @@ class AntminerScanner:
 
             # Use VNish API if detected
             if self.is_vnish_firmware(stats_response):
+                if self.debug and ip == self.debug_ip:
+                    print(f"Debug: VNish firmware detected for {ip}")
+                
                 chains_response = self.send_vnish_command(ip, "chains")
                 if chains_response:  # chains_response is a list of chain objects
+                    if self.debug and ip == self.debug_ip:
+                        print(f"Debug: Using VNish API data for {ip}")
+                    
                     chain_counts.clear()  # Reset to use VNish data
                     for chain in chains_response:
                         chain_id = chain['id']  # Use 'id' as the chain number (1, 2, 3)
                         status_state = chain['status'].get('state', 'unknown')
                         chips = chain.get('chips', [])
+                        
                         # Determine ASIC count: online if mining and chips have non-zero hr, else 0
                         if status_state == "mining" and chips and any(chip['hr'] > 0 for chip in chips):
                             asic_count = len(chips)
+                            if self.debug and ip == self.debug_ip:
+                                print(f"Debug: Chain {chain_id} is online with {asic_count} ASICs")
                         else:
                             asic_count = 0  # Offline if not mining or no active chips
+                            if self.debug and ip == self.debug_ip:
+                                print(f"Debug: Chain {chain_id} is offline (status: {status_state}, chips: {len(chips)})")
+                        
                         chain_counts[f"chain_acn{chain_id}"] = asic_count
                         chain_total = len(chains_response)  # 3 chains per miner
+                    
                     # Re-infer model based on VNish chain data (max non-zero ASIC count)
                     non_zero_counts = [count for count in chain_counts.values() if count > 0]
                     max_asic = max(non_zero_counts) if non_zero_counts else 0
@@ -141,12 +182,18 @@ class AntminerScanner:
                     serials.append(f"Model (inferred from VNish ASIC count {max_asic}): {model}")
                 else:
                     # Fall back to CGMiner stats if VNish /chains fails
+                    if self.debug and ip == self.debug_ip:
+                        print(f"Debug: VNish API failed, falling back to CGMiner stats for {ip}")
+                    
                     non_zero_counts = [count for count in chain_counts.values() if count > 0]
                     max_asic = max(non_zero_counts) if non_zero_counts else 0
                     model = self.ASIC_TO_MODEL.get(max_asic, "Unknown")
                     serials.append(f"Model (inferred from CGMiner ASIC count {max_asic}): {model}")
             else:
                 # Use CGMiner stats if not VNish
+                if self.debug and ip == self.debug_ip:
+                    print(f"Debug: Not VNish firmware, using CGMiner stats for {ip}")
+                
                 non_zero_counts = [count for count in chain_counts.values() if count > 0]
                 max_asic = max(non_zero_counts) if non_zero_counts else 0
                 model = self.ASIC_TO_MODEL.get(max_asic, "Unknown")
@@ -160,9 +207,18 @@ class AntminerScanner:
         chain_total = 0
         model = "Unknown"
         
+        if self.debug and ip == self.debug_ip:
+            print(f"Debug: Scanning miner {ip}")
+        
         stats_response = self.send_cgminer_command(ip, "stats")
         if stats_response:
+            if self.debug and ip == self.debug_ip:
+                print(f"Debug: Got CGMiner stats response for {ip}")
+                print(json.dumps(stats_response, indent=2))
+            
             serials, chain_counts, chain_total, model = self.extract_data(stats_response, ip)
+        elif self.debug and ip == self.debug_ip:
+            print(f"Debug: Failed to get CGMiner stats response for {ip}")
         
         return ip, serials, chain_counts, chain_total, model
 
@@ -194,14 +250,28 @@ class AntminerScanner:
         return results
 
 def main():
-    while True:
-        try:
-            ip_ranges = input("Enter IP ranges to scan (e.g., 10.1.10.0-255, 10.1.20.0-100): ")
-            scanner = AntminerScanner(ip_ranges, timeout=15, retries=3)
-            ip_list = scanner.parse_ip_ranges()
-            break
-        except ValueError as e:
-            print(f"Error: {e}. Please try again.")
+    parser = argparse.ArgumentParser(description='Scan for Antminer ASICs')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--ip', help='Specific IP to debug')
+    parser.add_argument('--range', help='IP range to scan (e.g., 10.1.10.0-255)')
+    args = parser.parse_args()
+    
+    ip_ranges = args.range
+    if not ip_ranges:
+        while True:
+            try:
+                ip_ranges = input("Enter IP ranges to scan (e.g., 10.1.10.0-255, 10.1.20.0-100): ")
+                if ip_ranges:
+                    break
+            except ValueError as e:
+                print(f"Error: {e}. Please try again.")
+    
+    try:
+        scanner = AntminerScanner(ip_ranges, timeout=15, retries=3, debug=args.debug, debug_ip=args.ip)
+        ip_list = scanner.parse_ip_ranges()
+    except ValueError as e:
+        print(f"Error: {e}. Please try again.")
+        return
     
     results = scanner.scan_network()
     
@@ -232,9 +302,10 @@ def main():
                         chains_offline += 1
                 total_chains += chain_total
             
-            zero_chains = [chain for count in chain_counts.values() if count == 0]
+            # Fix: Correctly identify chains with zero ASICs
+            zero_chains = [k for k, v in chain_counts.items() if v == 0]
             if zero_chains:
-                zero_asic_ips.append(f"'{ip}' '{', '.join([k for k, v in chain_counts.items() if v == 0])}'")
+                zero_asic_ips.append(f"'{ip}' '{', '.join(zero_chains)}'")
             if chain_total > 0 and chain_total < 3:
                 less_than_three_chains_ips.append(f"'{ip}' 'Reported {chain_total} chains'")
             
